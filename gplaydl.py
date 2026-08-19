@@ -89,7 +89,16 @@ def _get_browser_context():
     if not BROWSER_BYPASS_ENABLED:
         return None
     if _browser_ctx is not None:
-        return _browser_ctx
+        if _browser is not None and not _browser.is_connected():
+            # browser crashed/closed since last use (OOM over a long batch run) --
+            # stale globals would raise TargetClosedError on next new_page().
+            try:
+                _pw.stop()
+            except Exception:
+                pass
+            _pw = _browser = _browser_ctx = None
+        else:
+            return _browser_ctx
     if _browser_warned:
         return None
     try:
