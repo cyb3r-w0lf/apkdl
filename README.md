@@ -18,7 +18,12 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
 
-Or just: `requests`, `google-play-scraper`, `dnspython`.
+Or just: `requests`, `google-play-scraper`, `dnspython`, `playwright`.
+
+For the cloudflare-bypass fallback (see below) playwright needs a browser. It
+uses your installed `google-chrome-stable` via `channel="chrome"` if present
+(no extra download); otherwise run `.venv/bin/playwright install chromium`
+once.
 
 ## Usage
 
@@ -31,6 +36,9 @@ Or just: `requests`, `google-play-scraper`, `dnspython`.
 
 # specific version instead of latest (best-effort — see Limitations)
 .venv/bin/python gplaydl.py com.whatsapp --version 2.24.1.75
+
+# specific architecture instead of the default variant (apkcombo only, see Limitations)
+.venv/bin/python gplaydl.py com.dts.freefireth --arch arm64-v8a
 
 # batch mode: one package/URL per line, garbage lines are skipped
 .venv/bin/python gplaydl.py --batch apps.txt --out apks/
@@ -82,10 +90,34 @@ separately in the summary — they don't stop the batch.
 | `--batch FILE` | one package/URL per line |
 | `--out DIR` | download destination (default: `apks/`) |
 | `--version VERSION` | target a specific version instead of latest (single target only) |
+| `--arch {arm64-v8a,armeabi-v7a,x86,x86_64}` | target a specific architecture variant instead of the default (apkcombo only) |
 | `-y`, `--yes` | skip the confirmation prompt when the app isn't found on Play Store |
 | `-c`, `--check` | only check availability, don't download |
 | `--csv FILE` | write check results as CSV (requires `--check`) |
 | `--table` | print check results as a terminal table (requires `--check`) |
+| `--no-browser` | disable the cloudflare-bypass browser fallback (faster, but a blocked request just fails) |
+
+## Cloudflare bypass
+
+apkpure/apkcombo occasionally TLS-reset or challenge plain `requests`
+(SSLEOFError, or a `cf-mitigated: challenge` response) — this is a JA3/TLS
+fingerprint check, not an interactive CAPTCHA. When it happens, the script
+transparently retries that one request through a real headless Chrome
+(`playwright`, `channel="chrome"`), whose TLS stack isn't fingerprinted the
+same way, and saves/reports whatever it gets back. One shared browser is
+launched lazily on first use and reused for the rest of the run. Disable with
+`--no-browser` if you'd rather fail fast.
+
+## Architecture selection
+
+`--arch` picks a specific ABI split instead of the default variant. Only
+apkcombo's download page exposes real per-architecture files (its "APK
+Variants" tab) — apkpure's direct-CDN trick and apkcombo's old JSON API both
+only ever return one fixed, non-selectable variant. When an app ships as a
+single universal/merged package (common for AAB-built apps), there's nothing
+to select between and `--arch` will report no match; the error lists which
+archs the app actually has (if any). `--arch` implies apkcombo as the only
+source, so it doesn't fall through to apkpure like the default flow does.
 
 ## Limitations
 
@@ -93,11 +125,14 @@ separately in the summary — they don't stop the batch.
   only reliably honors `version=latest`; arbitrary version strings often
   fail on all sources. Real per-version pinning would need APKMirror-style
   page scraping.
-- **apkmirror is not a source.** It sits behind Cloudflare Turnstile, which
+- **apkmirror is not a source, and the browser bypass above doesn't fix that.**
+  It sits behind an *interactive* Cloudflare Turnstile challenge, which
   blocked plain `requests`, headless Playwright (bundled Chromium and real
-  Chrome), and even headed Chrome under Xvfb — likely IP-reputation based,
-  not just a headless-browser fingerprint check. Only apkpure + apkcombo are
-  wired up.
+  Chrome), and even headed Chrome under Xvfb — likely IP-reputation based, not
+  a TLS-fingerprint check a real browser can quietly pass on its own. There's
+  no legitimate programmatic way to auto-solve an interactive Turnstile
+  widget without a paid third-party solving service, which this project
+  doesn't use. Only apkpure + apkcombo are wired up.
 - **ISP DNS poisoning workaround.** Some ISPs resolve `apkpure.com` /
   `apkcombo.com` to an unreachable bogus IP. The script bypasses the system
   resolver for those hosts specifically and queries `8.8.8.8`/`1.1.1.1`
