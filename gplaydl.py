@@ -143,7 +143,7 @@ def _is_cf_blocked(resp=None, exc=None):
         return False
     if resp.headers.get("cf-mitigated") == "challenge":
         return True
-    return resp.status_code in (403, 503)
+    return resp.status_code in (403, 429, 503)
 
 
 def browser_download(url, dest, timeout_ms=25_000):
@@ -288,6 +288,19 @@ def looks_like_apk(resp, min_bytes=200_000):
     if clen and int(clen) < min_bytes:
         return False
     return True
+
+
+def _valid_local_apk(path, min_bytes=100_000):
+    """Sanity-check a file already on disk before trusting it as 'already
+    downloaded' -- a partial/corrupt file from a killed run shouldn't be
+    skipped forever."""
+    try:
+        if path.stat().st_size < min_bytes:
+            return False
+        with open(path, "rb") as f:
+            return f.read(4).startswith(APK_MAGIC)
+    except OSError:
+        return False
 
 
 def save_stream(resp, dest):
@@ -590,6 +603,31 @@ CSV_FIELDS = ["input", "package_id", "wildcard", "arch", "title", "play_version"
               "apkpure_direct", "apkcombo", "apkpure_xapk", "available", "size_mb"]
 
 
+# ---- download manifest -----------------------------------------------------
+#
+# Tracks what's already been downloaded (package_id+arch -> file path + the
+# Play Store version it was pulled at) so re-runs can skip both the mirror
+# fetch AND the Play Store metadata lookup entirely for anything already on
+# disk, instead of re-querying Play Store for every line on every run.
+MANIFEST_FIELDS = ["package_id", "arch", "version", "play_version", "title", "path", "updated_at"]
+
+
+def load_manifest(path):
+    p = Path(path)
+    if not p.exists():
+        return {}
+    with open(p, newline="") as f:
+        return {(row["package_id"], row["arch"]): row for row in csv.DictReader(f)}
+
+
+def write_manifest(path, manifest):
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=MANIFEST_FIELDS)
+        writer.writeheader()
+        for row in sorted(manifest.values(), key=lambda r: (r["package_id"], r["arch"])):
+            writer.writerow(row)
+
+
 def check_one_structured(raw, version=None, arch=None):
     """Non-interactive check for one target, used by --csv/--table. Returns a CSV_FIELDS dict."""
     row = {f: "" for f in CSV_FIELDS}
@@ -667,10 +705,11 @@ def download_apk(package_id, out_dir, version=None, arch=None):
     session = requests.Session()
     name = f"{package_id}" + (f"_{version}" if version else "") + (f"_{arch}" if arch else "")
     dest = Path(out_dir) / f"{name}.apk"
-    if dest.exists():
+    if dest.exists() and _valid_local_apk(dest):
         return True, dest, "already downloaded"
-    if dest.with_suffix(".xapk").exists():
-        return True, dest.with_suffix(".xapk"), "already downloaded"
+    xapk_dest = dest.with_suffix(".xapk")
+    if xapk_dest.exists() and _valid_local_apk(xapk_dest):
+        return True, xapk_dest, "already downloaded"
 
     if arch:
         # only apkcombo's variants page can pick a specific arch (see ARCHES note above)
@@ -686,6 +725,22 @@ def download_apk(package_id, out_dir, version=None, arch=None):
     return False, None, last_err
 
 
+_last_net_touch = None
+
+
+def _network_pace(delay):
+    """Space out real network hits (Play Store lookups, mirror fetches) by at
+    least `delay` seconds, instead of a blanket per-line sleep -- packages
+    that fast-skip via the manifest never call this, so a cron re-run that's
+    mostly no-ops doesn't waste time sleeping between skips."""
+    global _last_net_touch
+    if delay and _last_net_touch is not None:
+        remaining = delay - (time.time() - _last_net_touch)
+        if remaining > 0:
+            time.sleep(remaining)
+    _last_net_touch = time.time()
+
+
 def confirm(prompt):
     try:
         return input(f"{prompt} [y/N] ").strip().lower() in ("y", "yes")
@@ -693,16 +748,30 @@ def confirm(prompt):
         return False
 
 
-def process_one(raw, out_dir, version=None, arch=None, assume_yes=False, check_only=False):
+def process_one(raw, out_dir, version=None, arch=None, assume_yes=False, check_only=False,
+                 manifest=None, manifest_path=None, update=False, delay=0.0):
     package_id = extract_package_id(raw)
     if not package_id:
         print(f"[skip] can't resolve package id from: {raw!r}")
         return
 
+    key = (package_id, arch or "")
+    entry = manifest.get(key) if manifest is not None else None
+
+    # fast path: manifest says it's already downloaded and update-checking wasn't
+    # asked for -- skip without touching the network at all (no Play Store call,
+    # no mirror probe, no pacing delay either). This is what makes re-running a
+    # big batch file (or a cron re-run where most of the list is unchanged) fast.
+    if entry and not check_only and not update and _valid_local_apk(Path(entry["path"])):
+        print(f"[skip] {package_id}: already downloaded -> {entry['path']} "
+              f"(pass --update to check for a newer Play Store version)")
+        return True
+
     print(f"[*] {package_id}: querying Play Store metadata...")
     if is_wildcard(raw):
         print(f"    [!] wildcard entry ({raw.strip()!r}) -- using base package only, "
               f"subvariants under it are not enumerated")
+    _network_pace(delay)
     meta = get_play_metadata(package_id)
     if meta:
         print(f"    title={meta['title']!r} version={meta['version']!r} dev={meta['developer']!r}")
@@ -712,9 +781,19 @@ def process_one(raw, out_dir, version=None, arch=None, assume_yes=False, check_o
             print("    [skip] user declined")
             return None
 
+    # update mode: already downloaded, and the Play Store version hasn't moved
+    # since -- skip the mirror fetch too, we're already current.
+    if entry and update and not check_only and _valid_local_apk(Path(entry["path"])):
+        if meta and entry.get("play_version") and meta["version"] == entry["play_version"]:
+            print(f"    [skip] up to date (play version {meta['version']} unchanged)")
+            return True
+        print(f"    [!] play version changed {entry.get('play_version') or '?'!r} -> "
+              f"{meta['version'] if meta else '?'!r}, re-downloading")
+
     if check_only:
         print(f"    checking availability{f' (version {version})' if version else ''}"
               f"{f' (arch {arch})' if arch else ''}...")
+        _network_pace(delay)
         results = check_availability(package_id, version=version, arch=arch)
         any_ok = False
         for name, ok, detail, size in results:
@@ -725,12 +804,38 @@ def process_one(raw, out_dir, version=None, arch=None, assume_yes=False, check_o
         return any_ok
 
     print(f"    fetching apk{f' (version {version})' if version else ''}{f' (arch {arch})' if arch else ''}...")
+    _network_pace(delay)
     ok, path, info = download_apk(package_id, out_dir, version=version, arch=arch)
     if ok:
         print(f"    [+] saved -> {path} ({info})")
+        if manifest is not None and manifest_path is not None and path is not None:
+            manifest[key] = {
+                "package_id": package_id, "arch": arch or "", "version": version or "",
+                "play_version": meta["version"] if meta else "",
+                "title": meta["title"] if meta else "",
+                "path": str(path),
+                "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            }
+            write_manifest(manifest_path, manifest)
     else:
         print(f"    [-] all sources failed ({info})")
     return ok
+
+
+class _Tee:
+    """Mirrors stdout to a log file as well, for long unattended --batch runs."""
+
+    def __init__(self, stream, log_file):
+        self._stream = stream
+        self._log = log_file
+
+    def write(self, data):
+        self._stream.write(data)
+        self._log.write(data)
+
+    def flush(self):
+        self._stream.flush()
+        self._log.flush()
 
 
 def main():
@@ -755,11 +860,22 @@ def main():
     ap.add_argument("--no-browser", action="store_true",
                      help="disable the real-browser cloudflare-bypass fallback "
                           "(faster, but downloads/checks fail outright when cloudflare-blocked)")
+    ap.add_argument("--manifest", metavar="FILE",
+                     help="CSV tracking downloaded package/arch -> file + play version, used to skip "
+                          "already-downloaded packages instantly on re-runs (default: <out>/manifest.csv)")
+    ap.add_argument("--update", action="store_true",
+                     help="for packages already in the manifest, re-check the Play Store version and "
+                          "only re-download if it changed (default: skip already-downloaded instantly)")
+    ap.add_argument("--log", metavar="FILE", help="also write all output to this file")
     args = ap.parse_args()
 
     global BROWSER_BYPASS_ENABLED
     if args.no_browser:
         BROWSER_BYPASS_ENABLED = False
+
+    if args.log:
+        log_f = open(args.log, "a")
+        sys.stdout = _Tee(sys.stdout, log_f)
 
     if not args.target and not args.batch:
         ap.error("provide a target or --batch file")
@@ -773,6 +889,11 @@ def main():
     out_dir = Path(args.out)
     if not args.check:
         out_dir.mkdir(parents=True, exist_ok=True)
+
+    manifest = manifest_path = None
+    if not args.check:
+        manifest_path = args.manifest or str(out_dir / "manifest.csv")
+        manifest = load_manifest(manifest_path)
 
     if args.check and (args.csv or args.table):
         targets = Path(args.batch).read_text().splitlines() if args.batch else [args.target]
@@ -796,17 +917,17 @@ def main():
 
     if args.batch:
         lines = Path(args.batch).read_text().splitlines()
+        total = len(lines)
         ok_count = fail_count = skip_count = declined_count = 0
-        first = True
-        for line in lines:
+        for i, line in enumerate(lines, 1):
             pkg = extract_package_id(line)
             if not pkg:
                 skip_count += 1
                 continue
-            if not first:
-                time.sleep(args.delay)
-            first = False
-            result = process_one(line, out_dir, arch=args.arch, assume_yes=args.yes, check_only=args.check)
+            print(f"[{i}/{total}]", end=" ")
+            result = process_one(line, out_dir, arch=args.arch, assume_yes=args.yes, check_only=args.check,
+                                  manifest=manifest, manifest_path=manifest_path, update=args.update,
+                                  delay=args.delay)
             if result is True:
                 ok_count += 1
             elif result is None:
@@ -818,7 +939,8 @@ def main():
               f"{skip_count} skipped (non-package lines)")
     else:
         process_one(args.target, out_dir, version=args.version, arch=args.arch,
-                    assume_yes=args.yes, check_only=args.check)
+                    manifest=manifest, manifest_path=manifest_path, update=args.update,
+                    assume_yes=args.yes, check_only=args.check, delay=args.delay)
 
 
 if __name__ == "__main__":

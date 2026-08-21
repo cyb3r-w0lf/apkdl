@@ -96,6 +96,34 @@ separately in the summary — they don't stop the batch.
 | `--csv FILE` | write check results as CSV (requires `--check`) |
 | `--table` | print check results as a terminal table (requires `--check`) |
 | `--no-browser` | disable the cloudflare-bypass browser fallback (faster, but a blocked request just fails) |
+| `--manifest FILE` | manifest CSV path (default: `<out>/manifest.csv`) tracking downloaded package/arch -> file + Play version |
+| `--update` | re-check the Play Store version for already-downloaded packages, only re-download if it changed |
+| `--log FILE` | also write all output to this file |
+| `--delay SECONDS` | minimum spacing between real network hits (Play lookups, mirror fetches) -- packages that skip via the manifest don't wait at all (default: 2.0) |
+
+## Manifest & cron usage
+
+Every successful download is recorded in a manifest CSV (`<out>/manifest.csv`
+by default) keyed by package id + arch: the file path, the Play Store version
+it was pulled at, and when. On a plain re-run, anything already in the
+manifest (and still a valid apk/xapk on disk) is skipped **without any
+network call** -- no Play Store lookup, no mirror probe. `--update` changes
+that: it re-queries Play Store for each manifest entry and only re-downloads
+if the version actually changed, otherwise skips before touching mirrors.
+`--delay` paces real network hits as they happen rather than sleeping once
+per line, so a mostly-unchanged batch doesn't waste time waiting between
+packages that never touched the network.
+
+This makes the tool cron-friendly: first run downloads everything, every
+run after that with `--update` only re-fetches what actually moved.
+
+```bash
+# first run: downloads everything, builds the manifest
+.venv/bin/python gplaydl.py --batch apps.txt --out apks/ -y
+
+# cron: only re-downloads packages whose Play Store version changed
+.venv/bin/python gplaydl.py --batch apps.txt --out apks/ --update -y --log cron.log
+```
 
 ## Cloudflare bypass
 
